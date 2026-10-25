@@ -15,11 +15,15 @@ class WlanClient:
         Ritorna True se va a buon fine entro timeout secondi."""
         self._ssid = ssid
         self._password = password
+        if self.wlan.isconnected():
+            return True
+        self.wlan.disconnect()
         self.wlan.connect(ssid, password)
         start = time.time()
         while not self.wlan.isconnected():
             if time.time() - start > timeout:
                 return False
+            time.sleep_ms(100)
         return True
 
     def is_connected(self, timeout: int = 5) -> bool:
@@ -28,12 +32,13 @@ class WlanClient:
         while not self.wlan.isconnected():
             if time.time() - start > timeout:
                 return False
+            time.sleep_ms(100)
         return True
 
     def scan_for_ssid(self):
         """Ritorna la lista di SSID disponibili."""
         nets = self.wlan.scan()
-        return [net[0].decode('utf-8') for net in nets]
+        return [net[0].decode('utf-8', 'ignore') for net in nets]
 
     def get_connection_data(self):
         """Ritorna (ip, subnet, gateway, DNS) se connesso, altrimenti None."""

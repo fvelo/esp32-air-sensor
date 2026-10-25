@@ -1,188 +1,194 @@
-import machine
+"""Main application for the ESP32 air-quality sensor."""
+
+import json
+import os
 import time
 from machine import I2C, Pin, UART
 
-# comunication with server imports
-from connect_to_wifi import WlanClient
 import urequests
-import json
 
-# Sensors imports
+import config
+from connect_to_wifi import WlanClient
+from device_api import DeviceApiServer
 from pms5003 import PMS5003
-from scd4x_sensirion import SCD4xSensirion
 from scd4x_helper.bus_service import I2cAdapter
+from scd4x_sensirion import SCD4xSensirion
 
-def Main():
-    # Pin configuration for SCD4x (I2C1)
-    SCD_I2C_ID = 1
-    SCD_SCL_PIN = 40
-    SCD_SDA_PIN = 39
-    SCD_I2C_FREQ = 100_000  # 100 kHz
 
-    # PMS5003 UART pins
-    PMS_UART_ID = 1
-    PMS_TX_PIN = 9
-    PMS_RX_PIN = 10
-    PMS_BAUDRATE = 9600
-    PMS_ENABLE_PIN = 3
-    PMS_RESET_PIN = 2
+def load_wifi_credentials():
+    """Load persisted Wi-Fi values, falling back to config.py."""
+    credentials = {"ssid": config.WIFI_SSID, "password": config.WIFI_PASSWORD}
+    try:
+        with open(config.WIFI_CONFIG_FILE, "r") as file:
+            saved = json.load(file)
+        if isinstance(saved.get("ssid"), str) and isinstance(saved.get("password"), str):
+            credentials.update(saved)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return credentials
 
-    # Measurement intervals (seconds)
-    TEST_INTERVAL = 10        # for testing: every 10 seconds
-    NORMAL_INTERVAL = 10 * 60  # production: every 10 minutes
 
-    # Mode flag: True = testing, False = production
-    TEST_MODE = False
+def save_wifi_credentials(ssid, password):
+    """Persist Wi-Fi values without changing the active measurement loop."""
+    temporary_file = config.WIFI_CONFIG_FILE + ".tmp"
+    with open(temporary_file, "w") as file:
+        json.dump({"ssid": ssid, "password": password}, file)
+    try:
+        os.remove(config.WIFI_CONFIG_FILE)
+    except OSError:
+        pass
+    os.rename(temporary_file, config.WIFI_CONFIG_FILE)
 
-    # Initialize PMS5003 sensor
-    drv_uart = UART(PMS_UART_ID, tx=Pin(PMS_TX_PIN), rx=Pin(PMS_RX_PIN), baudrate=PMS_BAUDRATE)
-    pms5003 = PMS5003(uart=drv_uart,
-                      pin_enable=Pin(PMS_ENABLE_PIN),
-                      pin_reset=Pin(PMS_RESET_PIN),
-                      mode="active")
 
-    # Initialize SCD4x sensor
-    # Uses a separate I2C bus instance
-    i2c_scd = I2C(SCD_I2C_ID, scl=Pin(SCD_SCL_PIN), sda=Pin(SCD_SDA_PIN), freq=SCD_I2C_FREQ)
-    i2c_adapter = I2cAdapter(i2c_scd)
-    scd41 = SCD4xSensirion(adapter=i2c_adapter, this_is_scd41=True, check_crc=True)
+def create_scd41():
+    i2c = I2C(config.SCD_I2C_ID, scl=Pin(config.SCD_SCL_PIN),
+              sda=Pin(config.SCD_SDA_PIN), freq=config.SCD_I2C_FREQUENCY_HZ)
+    return SCD4xSensirion(adapter=I2cAdapter(i2c), this_is_scd41=True, check_crc=True)
 
-    #force sensor in IDLE mode
+
+def create_pms5003():
+    uart = UART(config.PMS_UART_ID, tx=Pin(config.PMS_TX_PIN),
+                rx=Pin(config.PMS_RX_PIN), baudrate=config.PMS_BAUDRATE)
+    return PMS5003(uart=uart, pin_enable=Pin(config.PMS_ENABLE_PIN),
+                   pin_reset=Pin(config.PMS_RESET_PIN), mode="active")
+
+
+def configure_scd41(scd41):
     scd41.start_measurement(start=False, single_shot=False)
-
-    scd41.set_altitude(155) # in metri
-    scd41.set_auto_calibration(value=False) # Perché quando è indor non va bene che si auto alineai
-
-    # Perform self-test on SCD4x
-    isScd41Working = False
+    scd41.set_altitude(config.SCD_ALTITUDE_METERS)
+    scd41.set_auto_calibration(config.SCD_AUTOMATIC_CALIBRATION)
     print("SCD4x: running self-test...")
-    if scd41.exec_self_test():
-        isScd41Working = True
-        print("SCD4x self-test passed.")
-    else:
-        print("SCD4x self-test failed. Check wiring.")
-
-    # Start continuous measurement for SCD4x
+    if not scd41.exec_self_test():
+        raise RuntimeError("SCD4x self-test failed; check the wiring")
+    print("SCD4x self-test passed.")
     scd41.start_measurement(start=True)
-    print("SCD4x: continuous measurement started.")
+    print("SCD4x continuous measurement started.")
 
-    # Select interval based on mode
-    interval = TEST_INTERVAL if TEST_MODE else NORMAL_INTERVAL
-    print(f"Measurement interval: {interval} seconds.")
 
-    # connection to wifi
-    print('Connection to wifi...')
-    wcl = WlanClient()
-    connectionResult = False
-    while not connectionResult:
-        connectionResult = wcl.connect_to_wifi('famiglia-velo-piano-1-2.4ghz','g27h54Etfq4')
-        print('La connessione è stata stabilita: ', connectionResult)
-    print('Connection succeded.')
+def connect_wifi(credentials):
+    client = WlanClient()
+    print("Connecting to Wi-Fi...")
+    while not client.connect_to_wifi(credentials["ssid"], credentials["password"],
+                                     timeout=config.WIFI_CONNECT_TIMEOUT_SECONDS):
+        print("Wi-Fi connection failed; retrying...")
+        time.sleep(config.WIFI_RETRY_DELAY_SECONDS)
+    print("Wi-Fi connected:", client.get_connection_data())
+    return client
 
-    # helper function
 
-    def sendDataToServer(payload):
-        url = "http://192.168.1.32:40004/api/v0/insert-air-data"
-        #url = "http://localhost:3000/api/v0/insert-air-data"
+def post_json(url, payload):
+    response = None
+    try:
+        response = urequests.post(url, data=json.dumps(payload),
+                                  headers={"Content-Type": "application/json"})
+        print("HTTP status:", response.status_code)
+        print("HTTP response:", response.text)
+        return response.status_code < 400
+    except OSError as error:
+        print("HTTP request failed:", error)
+        return False
+    finally:
+        if response is not None:
+            response.close()
 
-        # headers: tell the server we’re sending JSON
-        headers = {
-            "Content-Type": "application/json"
-        }
-        
-        response = urequests.post(url, data=json.dumps(payload), headers=headers)
-        print("Status:", response.status_code)
-        print("Response:", response.text)
-        response.close()   # free up sockets
+
+def read_air_quality(pms5003, scd41):
+    pms_data = pms5003.read()
+    print("PMS5003 ->")
+    print(pms_data)
+    pm1 = pms_data.pm_ug_per_m3(1.0, atmospheric_environment=True)
+    pm2_5 = pms_data.pm_ug_per_m3(2.5, atmospheric_environment=True)
+    pm10 = pms_data.pm_ug_per_m3(10, atmospheric_environment=True)
+    if not scd41.get_data_status():
+        print("SCD4x data not ready.")
+        return None
+
+    co2, temperature, humidity = scd41.get_measurement_value()
+    print("SCD4x -> CO2: {} ppm, Temperature: {:.2f} C, Humidity: {:.2f} %".format(
+        co2, temperature, humidity))
+    return {"temperature": temperature, "humidity": humidity, "pm1": pm1,
+            "pm2_5": pm2_5, "pm10": pm10, "co2": co2, "voc": 0,
+            "apiPassword": config.API_PASSWORD}
+
+
+def run(test_mode=None, send_data=True):
+    if test_mode is None:
+        test_mode = config.TEST_MODE
+
+    scd41 = create_scd41()
+    pms5003 = create_pms5003()
+    configure_scd41(scd41)
+    interval = (config.TEST_INTERVAL_SECONDS if test_mode
+                else config.NORMAL_INTERVAL_SECONDS)
+    state = {"started": time.time(), "last_measurement": None,
+             "pms5003_ok": False, "scd41_ok": False, "last_api_ok": None}
+    credentials = load_wifi_credentials()
+    wifi = connect_wifi(credentials)
+    if test_mode:
+        print("TEST MODE - API uploads disabled")
+        print("ESP32 IP address:", wifi.get_connection_data()[0])
+
+    def health():
+        now = time.time()
+        last = state["last_measurement"]
+        recent = last is not None and now - last <= max(interval * 2, 60)
+        return {"status": "ok" if recent and state["pms5003_ok"] and state["scd41_ok"]
+                else "starting", "measurement_active": True,
+                "last_measurement": last, "pms5003": state["pms5003_ok"],
+                "scd41": state["scd41_ok"],
+                "wifi": wifi is not None and wifi.is_connected(timeout=0),
+                "api_last_request_ok": state["last_api_ok"]}
+
+    def update_wifi(ssid, password):
+        save_wifi_credentials(ssid, password)
+        return {"saved": True, "requires_reboot": True}
+
+    api = DeviceApiServer(config.DEVICE_API_HOST, config.DEVICE_API_PORT,
+                          health, update_wifi, config.API_PASSWORD)
+    print("Device API listening on port {}".format(config.DEVICE_API_PORT))
 
     try:
         while True:
-            # Read PMS5003
-            pms_data = pms5003.read()
-            pms_data_list = pms_data.to_list()
-            print(f"PMS5003 format -> {pms_data}")
-            print(f"PMS5003 -> {pms_data_list}")
-            PM1 = pms_data_list[3]
-            PM2_5 = pms_data_list[4]
-            PM10 = pms_data_list[5]
+            api.poll()
+            try:
+                payload = read_air_quality(pms5003, scd41)
+                state["pms5003_ok"] = True
+                state["scd41_ok"] = payload is not None
+                if payload is not None:
+                    state["last_measurement"] = time.time()
+                    if send_data:
+                        state["last_api_ok"] = post_json(config.AIR_DATA_ENDPOINT, payload)
+            except Exception as error:
+                print("Measurement error:", error)
 
-
-            # Read SCD4x when data is ready
-            if not scd41.get_data_status():
-                print("SCD4x data not ready.")
-                time.sleep(5)
-                continue
-                    
-            co2, scd_temp, scd_rh = scd41.get_measurement_value()
-            print(f"SCD4x -> CO2: {co2} ppm, Temperature: {scd_temp:.2f} °C, Humidity: {scd_rh:.2f} %")
-            
-            # preparing payload
-            payload = {
-                "temperature": scd_temp,
-                "humidity": scd_rh,
-                "pm1": PM1,
-                "pm2_5": PM2_5,
-                "pm10": PM10,
-                "co2": co2,
-                "voc": 0, # for now
-                "apiPassword": '&ng%yAYbXNTBn8D#45r43!TXNwtzZhHkFV9^UE2bS^Vhd&Ksz2LdVhtwv&uNYxAyBk&MoC'
-            }
-            
-            # send data to server
-            sendDataToServer(payload)
-            
-            # Wait for next cycle
-            time.sleep(interval)
-
+            remaining = interval if state["last_measurement"] is not None else config.SCD_DATA_NOT_READY_DELAY_SECONDS
+            while remaining > 0:
+                api.poll()
+                time.sleep_ms(100)
+                remaining -= 0.1
     except KeyboardInterrupt:
-        # Stop SCD4x measurements on exit
+        print("Stopping measurements.")
+    finally:
+        api.close()
         scd41.start_measurement(start=False, single_shot=False)
-        print("Stopped SCD4x measurements. Exiting.")
-    
+        print("SCD4x measurements stopped.")
+
+
 def calibrateSensor():
-    # Pin configuration for SCD4x (I2C1)
-    SCD_I2C_ID = 1
-    SCD_SCL_PIN = 40
-    SCD_SDA_PIN = 39
-    SCD_I2C_FREQ = 100_000  # 100 kHz
-        
-    i2c_scd = I2C(SCD_I2C_ID, scl=Pin(SCD_SCL_PIN), sda=Pin(SCD_SDA_PIN), freq=SCD_I2C_FREQ)
-    i2c_adapter = I2cAdapter(i2c_scd)
-    scd41 = SCD4xSensirion(adapter=i2c_adapter, this_is_scd41=True, check_crc=True)
-
-    scd41.set_auto_calibration(value=False) # Perché quando è indor non va bene che si auto alineai
+    scd41 = create_scd41()
+    scd41.set_auto_calibration(config.SCD_AUTOMATIC_CALIBRATION)
     scd41.start_measurement(start=True)
-    time.sleep(15)
-    co2, scd_temp, scd_rh = scd41.get_measurement_value()
+    try:
+        time.sleep(config.CALIBRATION_STARTUP_DELAY_SECONDS)
+        scd41.get_measurement_value()
+        print("Waiting for the calibration measurement period...")
+        time.sleep(config.CALIBRATION_MEASUREMENT_SECONDS)
+        scd41.start_measurement(start=False, single_shot=False)
+        result = scd41.force_recalibration(config.CALIBRATION_REFERENCE_CO2_PPM)
+        print("Calibration result:", result)
+        post_json(config.CALIBRATION_ENDPOINT, {"isSuccess": result})
+    finally:
+        scd41.start_measurement(start=False, single_shot=False)
 
-    #set interval for 5 minutes because 3 min of mesureing is necessary to make the calibration succesful
-    print('ora attendo 5 min')
-    time.sleep(3 * 60 + 30)
-    
-    scd41.start_measurement(start=False, single_shot=False)
 
-    x = scd41.force_recalibration(400) #normally concentration in the ourside air is 400ppm
-    time.sleep(1)
-    print('Successo:', x)
-
-        
-    body = {
-        "isSuccess": x    
-    }
-        
-    url = "http://192.168.1.32:40004/api/v0/is-calibrated"
-
-    # headers: tell the server we’re sending JSON
-    headers = {
-        "Content-Type": "application/json"
-    }
-        
-    response = urequests.post(url, data=json.dumps(body), headers=headers)
-    print("Status:", response.status_code)
-    print("Response:", response.text)
-    response.close()   # free up sockets
-        
-        
-
-        
-        
+Main = run

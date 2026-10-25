@@ -4,11 +4,14 @@ WIFI_SSID = "your-wifi-ssid"
 WIFI_PASSWORD = "your-wifi-password"
 WIFI_CONNECT_TIMEOUT_SECONDS = 15
 WIFI_RETRY_DELAY_SECONDS = 5
+WIFI_CONFIG_FILE = "wifi_config.json"
 
 API_BASE_URL = "http://192.168.1.2:40004/api/v0"
 API_PASSWORD = "replace-with-api-password"
 AIR_DATA_ENDPOINT = API_BASE_URL + "/insert-air-data"
 CALIBRATION_ENDPOINT = API_BASE_URL + "/is-calibrated"
+DEVICE_API_HOST = "0.0.0.0"
+DEVICE_API_PORT = 80
 
 SCD_I2C_ID = 1
 SCD_SCL_PIN = 40
